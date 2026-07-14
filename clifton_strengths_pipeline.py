@@ -69,6 +69,12 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.pagebreak import Break
+from docx import Document
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor, Emu
 
 # ---------------------------------------------------------------------------
 # Fixed Gallup CliftonStrengths 34 -> Domain mapping (does not vary by person)
@@ -377,6 +383,16 @@ DOMAIN_CHART_COLORS = {
     "Strategic Thinking": "#9BBB59",     # green
 }
 
+# Light tint of each domain color — used as the background for EVERY cell in that
+# domain's columns; the deep DOMAIN_CHART_COLORS above is reserved for a person's
+# top-5 ranked cells only, so the highlight still stands out against the tint.
+DOMAIN_LIGHT_HEX = {
+    "Executing": "E2D5F0",
+    "Influencing": "FCE4D6",
+    "Relationship Building": "DDEBF7",
+    "Strategic Thinking": "E2EFDA",
+}
+
 
 def _wheel_layout() -> list:
     """34 (domain, theme, angle_in_radians) entries, each domain filling a fixed 90° quadrant,
@@ -430,6 +446,306 @@ def generate_wheel_png(name: str, rank_of_theme: dict, out_path: Path):
     fig.tight_layout(pad=0.3)
     fig.savefig(out_path, transparent=True)
     plt.close(fig)
+
+
+def top_n_themes(rank_of_theme: dict, n: int = 5) -> list:
+    """rank_of_theme: {theme_name: rank_number}. Returns the n theme names with the
+    lowest rank number (1 = strongest), in rank order."""
+    return [theme for theme, _rank in sorted(rank_of_theme.items(), key=lambda kv: kv[1])[:n]]
+
+
+def _render_card_face(name: str, top5: list, out_path: Path, size_in=(8.5, 4.25), dpi=150):
+    """Renders ONE card face (name + top 5 strengths) as a standalone PNG."""
+    fig = plt.figure(figsize=size_in, dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    ax.text(0.5, 0.82, name.title(), fontsize=28, fontweight="bold",
+            ha="center", va="center", family="sans-serif")
+    ax.text(0.5, 0.68, "TOP 5 STRENGTHS", fontsize=11, color="#888888",
+            ha="center", va="center", family="sans-serif")
+
+    y = 0.52
+    for theme in top5:
+        domain = DOMAIN_MAP[theme]
+        color = DOMAIN_CHART_COLORS[domain]
+        ax.add_patch(plt.Rectangle((0.30, y - 0.028), 0.03, 0.056, color=color))
+        ax.text(0.37, y, theme, fontsize=17, ha="left", va="center", family="sans-serif")
+        y -= 0.115
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def generate_name_card_png(name: str, top5: list, out_path: Path):
+    """Renders a full US-Letter page (portrait) with the SAME card content printed
+    twice: right-side-up in the bottom half, upside-down in the top half — so when
+    the page is folded in half at the middle, it reads correctly from both sides as
+    a table tent. top5: list of theme names, strongest first."""
+    from PIL import Image, ImageDraw
+
+    dpi = 150
+    page_w, page_h = int(8.5 * dpi), int(11 * dpi)
+    half_w, half_h = page_w, page_h // 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        face_path = Path(tmp) / "face.png"
+        _render_card_face(name, top5, face_path, size_in=(8.5, 4.25), dpi=dpi)
+        face = Image.open(face_path).convert("RGBA")
+        face = face.resize((half_w, half_h))
+        face_rotated = face.rotate(180)
+
+        page = Image.new("RGBA", (page_w, page_h), "white")
+        page.paste(face_rotated, (0, 0), face_rotated)
+        page.paste(face, (0, page_h - half_h), face)
+
+        draw = ImageDraw.Draw(page)
+        y_fold = page_h // 2
+        dash_len, gap_len, x = 10, 8, int(0.05 * page_w)
+        while x < page_w - int(0.05 * page_w):
+            draw.line([(x, y_fold), (min(x + dash_len, page_w), y_fold)], fill="#BBBBBB", width=2)
+            x += dash_len + gap_len
+
+        page.convert("RGB").save(out_path)
+
+
+def _set_cell_shading(cell, color_hex: str):
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), color_hex)
+    tcPr.append(shd)
+
+
+def _set_landscape(document):
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+    section.left_margin = section.right_margin = Inches(0.4)
+    section.top_margin = section.bottom_margin = Inches(0.4)
+    return section
+
+
+def _set_tabloid_landscape(document):
+    """Workshop grid has 34 narrow theme columns plus name/domain columns — that
+    doesn't fit a Letter-size page at a readable font, so this document uses
+    Tabloid (11x17in) landscape instead, which is what a print shop / office
+    printer set to 'ledger' or 'tabloid' paper will produce."""
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width = Inches(17)
+    section.page_height = Inches(11)
+    section.left_margin = section.right_margin = Inches(0.4)
+    section.top_margin = section.bottom_margin = Inches(0.4)
+    return section
+
+
+def _set_col_widths(table, widths):
+    """Force explicit column widths on every cell AND on the underlying <w:tblGrid>
+    with a FIXED table layout. Setting cell.width alone is silently ignored by
+    Word/LibreOffice's autofit, which redistributes columns roughly evenly and
+    causes header text to wrap letter-by-letter in a narrow-name-name column —
+    the failure mode from the very first version of this table."""
+    table.autofit = False
+
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+    tblLayout = tblPr.find(qn("w:tblLayout"))
+    if tblLayout is None:
+        tblLayout = OxmlElement("w:tblLayout")
+        tblPr.append(tblLayout)
+    tblLayout.set(qn("w:type"), "fixed")
+
+    tblGrid = tbl.find(qn("w:tblGrid"))
+    for gridCol, width in zip(tblGrid.findall(qn("w:gridCol")), widths):
+        gridCol.set(qn("w:w"), str(width.twips))
+
+    for row in table.rows:
+        for cell, width in zip(row.cells, widths):
+            cell.width = width
+
+
+def _add_full_grid_table(document, people_rows: list):
+    """ONE continuous table (Name + Leading Domain + all 34 theme columns), not
+    split by domain — matches the team's own tracker, which is one wide sheet.
+    Report Date / Source File are dropped from this printed view (they're
+    bookkeeping columns, not something a workshop room needs to see); they're
+    still in the data spreadsheet. Column widths are computed to exactly fill a
+    Tabloid-landscape page and enforced via a fixed table layout so headers wrap
+    normally (word-by-word) instead of collapsing to letter-by-letter."""
+    info_cols = ["Name", "Leading Domain"]
+    usable_width = Inches(17) - 2 * Inches(0.4)
+    name_width = Inches(1.3)
+    domain_width = Inches(1.0)
+    theme_col_width = Emu(int((usable_width - name_width - domain_width) / len(ORDERED_THEMES)))
+    info_widths = [name_width, domain_width]
+    col_widths = info_widths + [theme_col_width] * len(ORDERED_THEMES)
+
+    table = document.add_table(rows=2 + len(people_rows), cols=len(info_cols) + len(ORDERED_THEMES))
+
+    # Row 1: domain banner, merged across each domain's theme columns
+    banner = table.rows[0].cells
+    for c in banner[:len(info_cols)]:
+        c.text = ""
+    col = len(info_cols)
+    for domain in DOMAIN_ORDER:
+        span = len(DOMAIN_THEMES_ORDERED[domain])
+        merged_cell = banner[col]
+        for extra in range(1, span):
+            merged_cell = merged_cell.merge(banner[col + extra])
+        merged_cell.text = domain.upper()
+        _set_cell_shading(merged_cell, DOMAIN_CHART_COLORS[domain].lstrip("#"))
+        merged_cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in merged_cell.paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(8)
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        col += span
+
+    # Row 2: column headers, all horizontal — theme names word-wrap onto 2 lines
+    # in their narrow columns since the widths above are now actually enforced.
+    header = table.rows[1].cells
+    for i, h in enumerate(info_cols):
+        header[i].text = h
+        _set_cell_shading(header[i], "305496")
+        header[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in header[i].paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(8)
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    for i, theme in enumerate(ORDERED_THEMES, start=len(info_cols)):
+        cell = header[i]
+        cell.text = theme
+        domain = DOMAIN_MAP[theme]
+        _set_cell_shading(cell, DOMAIN_CHART_COLORS[domain].lstrip("#"))
+        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in cell.paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(6.5)
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    table.rows[1].height = Inches(0.55)
+
+    # Data rows
+    for r, (name, row) in enumerate(people_rows, start=2):
+        rank_of_theme = {t: row[t] for t in ORDERED_THEMES}
+        top5 = set(top_n_themes(rank_of_theme, 5))
+
+        cells = table.rows[r].cells
+        cells[0].text = name
+        cells[1].text = str(row.get("Leading Domain", ""))
+        for c in cells[:len(info_cols)]:
+            for run in c.paragraphs[0].runs:
+                run.font.size = Pt(7)
+
+        for i, theme in enumerate(ORDERED_THEMES, start=len(info_cols)):
+            cell = cells[i]
+            cell.text = str(row[theme])
+            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            domain = DOMAIN_MAP[theme]
+            for run in cell.paragraphs[0].runs:
+                run.font.size = Pt(7)
+            if theme in top5:
+                _set_cell_shading(cell, DOMAIN_CHART_COLORS[domain].lstrip("#"))
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
+                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            else:
+                # Neutral alternating column banding (matches the reference tracker,
+                # which shades whole columns gray/white for readability — domain
+                # color is reserved for the header banner and each person's top 5).
+                col_index = i - len(info_cols)
+                _set_cell_shading(cell, "F2F2F2" if col_index % 2 == 0 else "FFFFFF")
+
+    _set_col_widths(table, col_widths)
+    return table
+
+
+def build_workshop_docx(merged: dict, output_path: Path):
+    """Builds the Word 'workshop workbook' — one continuous team rank table (all
+    34 themes, no domain-split tables) on a Tabloid-landscape page, followed by
+    every person's wheel chart, 2 per row, with a page break after each row so a
+    chart never gets sliced across a page. Pure python-docx — no external runtime
+    needed, so this can run inside the deployed Streamlit app as well as the CLI."""
+    document = Document()
+    _set_tabloid_landscape(document)
+
+    document.add_heading("CliftonStrengths Workshop Workbook", level=1)
+    document.add_paragraph("Full team rank table — all 34 themes").italic = True
+
+    people_rows = sorted(merged.items())
+    _add_full_grid_table(document, people_rows)
+    document.add_paragraph("")
+
+    document.add_page_break()
+    document.add_heading("Strengths Wheels", level=1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        for i in range(0, len(people_rows), 2):
+            pair = people_rows[i:i + 2]
+            table = document.add_table(rows=2, cols=2)
+            table.autofit = True
+            for col, (name, row) in enumerate(pair):
+                rank_of_theme = {theme: row[theme] for theme in ORDERED_THEMES}
+                png_path = tmp_dir / f"wheel_{i}_{col}.png"
+                generate_wheel_png(name, rank_of_theme, png_path)
+
+                name_cell = table.rows[0].cells[col]
+                name_cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = name_cell.paragraphs[0].add_run(name)
+                run.bold = True
+
+                img_cell = table.rows[1].cells[col]
+                img_cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                img_cell.paragraphs[0].add_run().add_picture(str(png_path), width=Inches(3.3))
+
+            if i + 2 < len(people_rows):
+                document.add_page_break()
+
+        document.save(output_path)
+
+
+def build_name_cards_docx(merged: dict, output_path: Path):
+    """Builds the table name cards — one tent-fold card per person (name + top 5
+    strengths, printed twice so folding the page in half reads correctly from both
+    sides), each on its own page."""
+    document = Document()
+    section = document.sections[0]
+    MARGIN = Inches(0.1)
+    section.left_margin = section.right_margin = MARGIN
+    section.top_margin = section.bottom_margin = MARGIN
+    # shrink slightly below the true printable area — some renderers add a hair of
+    # line-height around the image's paragraph, which otherwise spills a blank page
+    SAFETY = 0.96
+    printable_w = int((section.page_width - 2 * MARGIN) * SAFETY)
+    printable_h = int((section.page_height - 2 * MARGIN) * SAFETY)
+
+    people_rows = sorted(merged.items())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        for i, (name, row) in enumerate(people_rows):
+            rank_of_theme = {theme: row[theme] for theme in ORDERED_THEMES}
+            top5 = top_n_themes(rank_of_theme, 5)
+            png_path = tmp_dir / f"card_{i}.png"
+            generate_name_card_png(name, top5, png_path)
+
+            paragraph = document.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.0
+            # explicit width AND height, sized to the printable area exactly — the
+            # source PNG is already an 8.5x11 page, so this just fits it to the
+            # section's printable box regardless of any DPI metadata on the file.
+            paragraph.add_run().add_picture(str(png_path), width=printable_w, height=printable_h)
+
+            if i < len(people_rows) - 1:
+                document.add_page_break()
+
+        document.save(output_path)
 
 
 def build_wheels_workbook(merged: dict, output_path: Path):
@@ -528,19 +844,27 @@ def collect_reports(input_path: Path) -> list:
 HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
 BODY_FONT = Font(name="Arial")
-DOMAIN_FILL = {
-    "Executing": PatternFill(start_color="E2D5F0", end_color="E2D5F0", fill_type="solid"),
-    "Influencing": PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
-    "Relationship Building": PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid"),
-    "Strategic Thinking": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
-}
+DOMAIN_FILL = {d: PatternFill(start_color=hex_, end_color=hex_, fill_type="solid")
+               for d, hex_ in DOMAIN_LIGHT_HEX.items()}
 
 
 DOMAIN_BANNER_FILL = {d: PatternFill(start_color=DOMAIN_CHART_COLORS[d].lstrip("#"),
                                       end_color=DOMAIN_CHART_COLORS[d].lstrip("#"),
                                       fill_type="solid")
                        for d in DOMAIN_ORDER}
+
+# Same deep domain colors as the banners — used to highlight only a person's TOP 5
+# ranked themes (rank 1-5), matching the team's own tracker: everything else stays
+# plain white, so the five deep-colored cells are what draws the eye.
+DOMAIN_TOP5_FILL = DOMAIN_BANNER_FILL
+TOP5_FONT = Font(name="Arial", bold=True, color="FFFFFF")
 INFO_COLUMNS = ["Name", "Report Date", "Source File", "Leading Domain"]
+
+# Neutral alternating column banding for non-top5 cells, matching the reference
+# tracker (whole columns shaded gray/white for readability; domain color is
+# reserved for the banner row and each person's top-5 highlight).
+BAND_FILL_GRAY = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+BAND_FILL_WHITE = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
 
 
 def build_workbook(reports: list, output_path: Path):
@@ -584,6 +908,10 @@ def build_workbook(reports: list, output_path: Path):
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "E3"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
 
     merged = dict(existing_rows)
     for r in reports:
@@ -594,57 +922,56 @@ def build_workbook(reports: list, output_path: Path):
         merged[r["name"]] = row
 
     for row_idx, (name, row) in enumerate(sorted(merged.items()), start=3):
+        rank_of_theme = {theme: row[theme] for theme in ORDERED_THEMES}
+        top5 = set(top_n_themes(rank_of_theme, 5))
         for col_idx, h in enumerate(all_headers, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=row.get(h, ""))
-            cell.font = BODY_FONT
             cell.alignment = Alignment(horizontal="center") if h in DOMAIN_MAP else Alignment()
             domain = DOMAIN_MAP.get(h)
-            if domain:
-                cell.fill = DOMAIN_FILL[domain]
+            if domain and h in top5:
+                cell.fill = DOMAIN_TOP5_FILL[domain]
+                cell.font = TOP5_FONT
+            elif domain:
+                theme_col_index = ORDERED_THEMES.index(h)
+                cell.fill = BAND_FILL_GRAY if theme_col_index % 2 == 0 else BAND_FILL_WHITE
+                cell.font = BODY_FONT
+            else:
+                cell.font = BODY_FONT
 
     for col_idx, h in enumerate(all_headers, start=1):
         width = 9 if h in DOMAIN_MAP else max(16, len(h) + 2)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-    ws2 = wb.create_sheet("Domain Summary (Top 10)")
-    summary_headers = ["Name"] + DOMAIN_ORDER + ["Leading Domain"]
-    for col, h in enumerate(summary_headers, start=1):
-        cell = ws2.cell(row=1, column=col, value=h)
-        cell.font = HEADER_FONT
-        cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center")
-    ws2.freeze_panes = "A2"
-
-    row_idx = 2
-    for name, row in sorted(merged.items()):
-        ranks = {row[theme]: theme for theme in ORDERED_THEMES}
-        counts = domain_counts_top10(ranks)
-        ws2.cell(row=row_idx, column=1, value=name).font = BODY_FONT
-        for col_offset, d in enumerate(DOMAIN_ORDER, start=2):
-            ws2.cell(row=row_idx, column=col_offset, value=counts[d]).font = BODY_FONT
-        ws2.cell(row=row_idx, column=len(DOMAIN_ORDER) + 2, value=leading_domain(ranks)).font = BODY_FONT
-        row_idx += 1
-    for col_idx in range(1, len(summary_headers) + 1):
-        ws2.column_dimensions[get_column_letter(col_idx)].width = 22
 
     wb.save(output_path)
     return merged
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract CliftonStrengths 34 results (PDF/Excel/CSV/pasted text) into a spreadsheet + a separate wheel-chart workbook.")
+    parser = argparse.ArgumentParser(description="Extract CliftonStrengths 34 results (PDF/Excel/CSV/pasted text) into a spreadsheet, a wheel-chart workbook, a workshop Word workbook, and printable name cards.")
     parser.add_argument("--input", required=True, help="A single file or a folder mixing .pdf/.txt/.csv/.xlsx files.")
     parser.add_argument("--output", required=True, help="Path to the output data .xlsx file.")
     parser.add_argument("--charts-output", default=None,
                          help="Path to the SEPARATE wheel-chart .xlsx file. Defaults to '<output>_Wheels.xlsx'.")
     parser.add_argument("--no-charts", action="store_true",
-                         help="Skip generating the wheel-chart file (faster for large batches).")
+                         help="Skip generating the wheel-chart .xlsx file.")
+    parser.add_argument("--workbook-output", default=None,
+                         help="Path to the workshop Word workbook (.docx). Defaults to '<output>_Workshop_Workbook.docx'.")
+    parser.add_argument("--no-workbook", action="store_true",
+                         help="Skip generating the workshop Word workbook.")
+    parser.add_argument("--cards-output", default=None,
+                         help="Path to the table name cards (.docx). Defaults to '<output>_Name_Cards.docx'.")
+    parser.add_argument("--no-cards", action="store_true",
+                         help="Skip generating the table name cards.")
     args = parser.parse_args()
 
     input_path = Path(args.input)
     output_path = Path(args.output)
     charts_output = Path(args.charts_output) if args.charts_output else \
         output_path.with_name(output_path.stem + "_Wheels" + output_path.suffix)
+    workbook_output = Path(args.workbook_output) if args.workbook_output else \
+        output_path.with_name(output_path.stem + "_Workshop_Workbook.docx")
+    cards_output = Path(args.cards_output) if args.cards_output else \
+        output_path.with_name(output_path.stem + "_Name_Cards.docx")
 
     reports = collect_reports(input_path)
     print(f"Parsed {len(reports)} report(s) successfully.")
@@ -659,6 +986,14 @@ def main():
     if not args.no_charts:
         chart_count = build_wheels_workbook(merged, charts_output)
         print(f"Wrote {chart_count} wheel chart(s) to {charts_output}")
+
+    if not args.no_workbook:
+        build_workshop_docx(merged, workbook_output)
+        print(f"Wrote workshop workbook to {workbook_output}")
+
+    if not args.no_cards:
+        build_name_cards_docx(merged, cards_output)
+        print(f"Wrote {len(merged)} name card(s) to {cards_output}")
 
 
 if __name__ == "__main__":
